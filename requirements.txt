@@ -1,0 +1,7 @@
+numpy
+scipy
+matplotlib
+hdbscan
+scikit-learn
+blimpy
+astropy
