@@ -2,7 +2,197 @@
 
 import numpy as np
 from scipy import stats
+from scipy import ndimage
+from skimage import filters, measure
 from blimpy import Waterfall
+
+
+# ─────────────────────────────────────────
+# 0a. DENOISE THE SPECTROGRAM
+# ─────────────────────────────────────────
+
+def denoise(data, median_filter_size=3):
+    """
+    Clean up the raw spectrogram before blob detection.
+
+    Steps:
+        1. Squeeze to 2D (time_steps, freq_channels)
+        2. Apply a median filter to kill random spikes (salt & pepper noise)
+        3. Subtract the noise floor so only structure remains
+
+    Why median and not mean?
+        A mean filter blurs everything including signal edges.
+        A median filter kills isolated spikes while keeping
+        the sharp edges of narrowband signals intact.
+
+    Args:
+        data             : numpy array (time_steps, 1, freq_channels)
+        median_filter_size : size of the median filter kernel
+
+    Returns:
+        cleaned : 2D numpy array (time_steps, freq_channels), noise-subtracted
+    """
+    print("[0a] Denoising spectrogram...")
+
+    # squeeze out the feed dimension → (time_steps, freq_channels)
+    d = data[:, 0, :].astype(np.float32)
+
+    # median filter — kills salt & pepper noise, preserves edges
+    filtered = ndimage.median_filter(d, size=median_filter_size)
+
+    # subtract the noise floor (median of each freq channel across time)
+    # this "flattens" the bandpass so bright RFI doesn't drown faint signals
+    noise_floor = np.median(filtered, axis=0)
+    cleaned     = filtered - noise_floor
+
+    # clip negatives to zero — we only care about things above the floor
+    cleaned = np.clip(cleaned, 0, None)
+
+    print(f"    Input shape  : {d.shape}")
+    print(f"    Output shape : {cleaned.shape}")
+    print(f"    Max value after cleaning: {cleaned.max():.2f}")
+
+    return cleaned
+
+
+# ─────────────────────────────────────────
+# 0b. BLOB DETECTION — CONNECTED COMPONENTS
+# ─────────────────────────────────────────
+
+def detect_blobs(cleaned, threshold_sigma=3.0, min_area=5):
+    """
+    Find distinct signal "blobs" in the cleaned spectrogram.
+
+    Method — Connected Component Labeling:
+        1. Threshold: anything above (mean + N*sigma) becomes a 1, rest 0
+           This creates a binary mask of "hot" pixels
+        2. Label: scipy.ndimage finds connected groups of 1s and gives
+           each group a unique integer label
+        3. Measure: skimage.measure.regionprops extracts bounding box,
+           area, centroid etc. for each labeled region
+        4. Filter: drop tiny regions (likely noise spikes, not real signals)
+
+    Args:
+        cleaned         : 2D array from denoise() — (time_steps, freq_channels)
+        threshold_sigma : how many std devs above mean = "hot pixel"
+                          lower = more sensitive, higher = only bright signals
+        min_area        : minimum pixel area to keep a blob (filters noise)
+
+    Returns:
+        blobs    : list of skimage RegionProps objects, one per detected blob
+        label_map: 2D array same shape as cleaned, each pixel labeled by blob ID
+                   (0 = background, 1,2,3... = blob IDs)
+    """
+    print(f"[0b] Detecting blobs (threshold: mean + {threshold_sigma}σ, "
+          f"min area: {min_area} px)...")
+
+    # ── Step 1: Threshold ──────────────────────────────────────────────────
+    mean  = cleaned.mean()
+    sigma = cleaned.std()
+    threshold = mean + threshold_sigma * sigma
+
+    binary = (cleaned > threshold).astype(np.uint8)
+
+    print(f"    Noise floor   : mean={mean:.2f}, σ={sigma:.2f}")
+    print(f"    Threshold     : {threshold:.2f}")
+    print(f"    Hot pixels    : {binary.sum()} / {binary.size}")
+
+    # ── Step 2: Label connected components ────────────────────────────────
+    # structure defines connectivity — here we use full 8-connectivity
+    # (diagonals count as connected, not just up/down/left/right)
+    structure = ndimage.generate_binary_structure(2, 2)
+    label_map, n_labels = ndimage.label(binary, structure=structure)
+
+    print(f"    Raw blobs found: {n_labels}")
+
+    # ── Step 3: Measure region properties ─────────────────────────────────
+    blobs = measure.regionprops(label_map, intensity_image=cleaned)
+
+    # ── Step 4: Filter small blobs ─────────────────────────────────────────
+    blobs = [b for b in blobs if b.area >= min_area]
+
+    print(f"    Blobs after size filter (>={min_area}px): {len(blobs)}")
+
+    return blobs, label_map
+
+
+# ─────────────────────────────────────────
+# 0c. VISUALIZE BLOBS (SANITY CHECK)
+# ─────────────────────────────────────────
+
+def plot_blobs(cleaned, blobs, freqs,
+               output_path="outputs/plots/blobs_detected.png"):
+    """
+    Save a plot of the cleaned spectrogram with bounding boxes
+    drawn around each detected blob.
+
+    Green box = detected signal region (ROI)
+    This is your visual proof that segmentation is working.
+
+    Args:
+        cleaned     : 2D cleaned spectrogram (time_steps, freq_channels)
+        blobs       : list of RegionProps from detect_blobs()
+        freqs       : 1D frequency array in MHz
+        output_path : where to save the PNG
+    """
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    import matplotlib.patches as patches
+    import os
+
+    print(f"[0c] Plotting blobs...")
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+
+    fig, ax = plt.subplots(figsize=(14, 6))
+
+    ax.imshow(
+        cleaned,
+        aspect="auto",
+        origin="upper",
+        cmap="inferno",
+        extent=[freqs.min(), freqs.max(), cleaned.shape[0], 0]
+    )
+
+    # draw a bounding box around each detected blob
+    freq_range  = freqs.max() - freqs.min()
+    freq_per_px = freq_range / cleaned.shape[1]
+
+    for blob in blobs:
+        # regionprops gives pixel coords — convert to MHz for the x axis
+        min_row, min_col, max_row, max_col = blob.bbox
+
+        x      = freqs.min() + min_col * freq_per_px
+        y      = min_row
+        width  = (max_col - min_col) * freq_per_px
+        height = max_row - min_row
+
+        rect = patches.Rectangle(
+            (x, y), width, height,
+            linewidth=1.5,
+            edgecolor="lime",
+            facecolor="none"
+        )
+        ax.add_patch(rect)
+
+        # label with SNR
+        ax.text(
+            x, y - 0.3,
+            f"SNR {blob.mean_intensity:.0f}",
+            color="lime",
+            fontsize=7,
+            va="bottom"
+        )
+
+    ax.set_xlabel("Frequency [MHz]")
+    ax.set_ylabel("Time Step")
+    ax.set_title(f"Blob Detection — {len(blobs)} signal(s) found")
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=150, bbox_inches="tight")
+    plt.close()
+
+    print(f"    Saved to: {output_path}")
+
 
 # ─────────────────────────────────────────
 # 1. FIND REGIONS OF INTEREST (ROIs)
@@ -111,11 +301,11 @@ def calculate_drift_rate(data, freqs, channel_indices, tsamp=18.25):
                            closer to 1.0 = cleaner drift line
     """
     # Extract just the channels belonging to this region
-    region_data = data[:, 0, channel_indices]   # shape: (time_steps, n_channels)
-    region_freqs = freqs[channel_indices]        # MHz values for those channels
+    region_data  = data[:, 0, channel_indices]   # shape: (time_steps, n_channels)
+    region_freqs = freqs[channel_indices]         # MHz values for those channels
 
     time_steps = region_data.shape[0]
-    times      = np.arange(time_steps) * tsamp  # convert step index → seconds
+    times      = np.arange(time_steps) * tsamp   # convert step index → seconds
 
     # For each time step, find the frequency of the peak power channel
     peak_chan_per_step = np.argmax(region_data, axis=1)
@@ -215,23 +405,27 @@ def extract_features(data, freqs, snr, snr_threshold=10.0, tsamp=18.25):
 
 if __name__ == "__main__":
 
-    # import our preprocess functions
     import sys
     sys.path.insert(0, "src")
     from preprocess import load_data, integrate_time, calculate_snr
 
     FILE = "data/raw/Voyager1.single_coarse.fine_res.h5"
 
-    # Run the full Phase 1 pipeline first
-    wf, data, freqs         = load_data(FILE, f_start=8419.2, f_stop=8419.4)
-    data_integrated         = integrate_time(data, n_steps=4)
-    snr                     = calculate_snr(data_integrated)
+    # Phase 1 pipeline
+    wf, data, freqs  = load_data(FILE, f_start=8419.2, f_stop=8419.4)
+    data_integrated  = integrate_time(data, n_steps=4)
+    snr              = calculate_snr(data_integrated)
 
-    # Now extract features
+    # Phase 2 — blob detection
+    cleaned          = denoise(data_integrated)
+    blobs, label_map = detect_blobs(cleaned, threshold_sigma=3.0, min_area=5)
+    plot_blobs(cleaned, blobs, freqs)
+
+    # Phase 3 — feature extraction
     features, labels, regions = extract_features(
         data_integrated, freqs, snr,
         snr_threshold=10.0,
-        tsamp=18.25 * 4        # tsamp × n_steps because we integrated
+        tsamp=18.25 * 4
     )
 
     if features.size > 0:
@@ -242,4 +436,4 @@ if __name__ == "__main__":
             print(f"{i+1:>3}  {row[0]:>12.4f}  {row[1]:>10.1f}  "
                   f"{row[2]:>8.1f}  {row[3]:>10.4f}  {row[4]:>6.3f}")
 
-    print("\n✅ features.py ran successfully!")
+    print("features.py ran successfully!")

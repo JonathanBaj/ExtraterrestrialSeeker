@@ -5,3 +5,4 @@ hdbscan
 scikit-learn
 blimpy
 astropy
+scikit-image
